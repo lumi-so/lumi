@@ -285,6 +285,7 @@ func BenchmarkLua_POST_Precompiled(b *testing.B) {
 // ============================================================
 
 // BenchmarkOverhead_PushAny_ResponseMap measures PushAny table construction cost.
+// Uses SetTop(0) and periodic GC to prevent unbounded string table growth in tight loops.
 func BenchmarkOverhead_PushAny_ResponseMap(b *testing.B) {
 	L := lua.NewState()
 	defer L.Close()
@@ -302,7 +303,10 @@ func BenchmarkOverhead_PushAny_ResponseMap(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		L.PushAny(resp)
-		L.Pop(1)
+		L.SetTop(0)
+		if i%10000 == 0 {
+			L.GCCollect()
+		}
 	}
 }
 
