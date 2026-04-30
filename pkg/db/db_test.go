@@ -1,4 +1,4 @@
-package binding
+package db
 
 import (
 	"database/sql"
