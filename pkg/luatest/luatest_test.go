@@ -1,7 +1,14 @@
 package luatest_test
 
 import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	lua "github.com/akzj/go-lua/pkg/lua"
 
 	"github.com/lumi-so/lumi/pkg/luatest"
 )
@@ -170,4 +177,135 @@ func TestRunDir(t *testing.T) {
 	if summary.Failed != 0 {
 		t.Fatalf("testdata tests failed: %d failures", summary.Failed)
 	}
+}
+
+func TestHooks(t *testing.T) {
+	var seq []string
+	runner := luatest.New(t, luatest.WithLibDir("../../lib"),
+		luatest.WithBeforeState(func(L *lua.State) { seq = append(seq, "beforeState") }),
+		luatest.WithAfterState(func(L *lua.State) { seq = append(seq, "afterState") }),
+		luatest.WithBeforeFile(func(path string, L *lua.State) { seq = append(seq, "beforeFile:"+path) }),
+		luatest.WithAfterFile(func(path string, L *lua.State, sum *luatest.RunSummary) {
+			if sum == nil {
+				t.Fatal("expected summary")
+			}
+			seq = append(seq, "afterFile")
+		}),
+	)
+	runner.RunString(`local test = require("lumi.test")
+		test.describe("H", function() test.it("x", function() test.assert(true) end) end)`)
+
+	want := []string{"beforeState", "beforeFile:<string>", "afterFile", "afterState"}
+	if len(seq) != len(want) {
+		t.Fatalf("seq = %v want %v", seq, want)
+	}
+	for i := range want {
+		if seq[i] != want[i] {
+			t.Fatalf("seq[%d] = %q want %q (full %v)", i, seq[i], want[i], seq)
+		}
+	}
+}
+
+func TestMergeSummaries(t *testing.T) {
+	a := &luatest.RunSummary{Passed: 1, Total: 1, Results: []luatest.TestResult{{Suite: "s", Name: "n", Passed: true}}}
+	b := &luatest.RunSummary{Failed: 1, Total: 1, Results: []luatest.TestResult{{Suite: "s", Name: "f", Passed: false, Error: "e"}}}
+	m := luatest.MergeSummaries(a, b)
+	if m.Passed != 1 || m.Failed != 1 || m.Total != 2 || len(m.Results) != 2 {
+		t.Fatalf("%+v", m)
+	}
+}
+
+func TestRunDirRecursive(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "nested")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	luaFile := filepath.Join(sub, "test_nested.lua")
+	code := `local test = require("lumi.test")
+test.describe("N", function() test.it("one", function() test.assert_eq(1,1) end) end)`
+	if err := os.WriteFile(luaFile, []byte(code), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := luatest.New(t, luatest.WithLibDir("../../lib"), luatest.WithRecursive(true))
+	sum := runner.RunDir(root)
+	if sum.Total != 1 || sum.Passed != 1 {
+		t.Fatalf("got %+v", sum)
+	}
+
+	empty := t.TempDir()
+	flat := luatest.New(t, luatest.WithLibDir("../../lib"))
+	if s := flat.RunDir(empty); s.Total != 0 {
+		t.Fatalf("empty dir should find 0, got %+v", s)
+	}
+}
+
+func TestFileMatcher(t *testing.T) {
+	root := t.TempDir()
+	p1 := filepath.Join(root, "test_keep.lua")
+	p2 := filepath.Join(root, "test_skip.lua")
+	for _, p := range []string{p1, p2} {
+		body := `local test = require("lumi.test")
+test.describe("X", function() test.it("k", function() test.assert(true) end) end)`
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := luatest.New(t, luatest.WithLibDir("../../lib"),
+		luatest.WithFileMatcher(func(full string) bool {
+			return strings.HasSuffix(full, "test_keep.lua")
+		}),
+	)
+	sum := runner.RunDir(root)
+	if sum.Total != 1 {
+		t.Fatalf("want 1 test, got %+v", sum)
+	}
+}
+
+func TestJUnitReporter(t *testing.T) {
+	mock := &mockTB{}
+	jr := luatest.NewJUnitReporter()
+	runner := luatest.New(mock, luatest.WithLibDir("../../lib"),
+		luatest.WithReporter(jr),
+	)
+	runner.RunString(`local test = require("lumi.test")
+test.describe("J", function()
+  test.it("ok", function() test.assert(true) end)
+  test.it("bad", function() test.assert_eq(1, 2) end)
+end)`)
+
+	var buf bytes.Buffer
+	if err := jr.WriteJUnit(&buf); err != nil {
+		t.Fatal(err)
+	}
+	s := buf.String()
+	if !strings.Contains(s, "<testsuites>") || !strings.Contains(s, `failures="1"`) {
+		t.Fatalf("unexpected xml: %s", s)
+	}
+}
+
+func TestRunDirContextCancelled(t *testing.T) {
+	mock := &mockTB{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runner := luatest.New(mock, luatest.WithLibDir("../../lib"))
+	func() {
+		defer func() { recover() }()
+		runner.RunDirContext(ctx, "../../testdata/")
+	}()
+	if !mock.failed {
+		t.Fatal("expected cancelled context to fail the run")
+	}
+}
+
+func TestSubtestsWithRealT(t *testing.T) {
+	t.Run("inner", func(t *testing.T) {
+		runner := luatest.New(t, luatest.WithLibDir("../../lib"), luatest.WithSubtests())
+		runner.RunString(`local test = require("lumi.test")
+test.describe("S", function()
+  test.it("a", function() test.assert(true) end)
+  test.it("b", function() test.assert_eq(2, 2) end)
+end)`)
+	})
 }

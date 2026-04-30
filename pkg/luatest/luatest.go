@@ -1,7 +1,9 @@
 package luatest
 
 import (
+	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,9 +37,19 @@ type Option func(*Runner)
 // Runner executes Lua test files.
 type Runner struct {
 	t       testing.TB
-	libDir  string              // directory containing lib/test.lua
-	setup   func(L *lua.State)  // custom setup (register modules, mocks)
+	libDir  string
+	setup   func(L *lua.State)
 	verbose bool
+
+	reporter    Reporter
+	subtests    bool
+	recursive   bool
+	fileMatcher func(fullPath string) bool
+
+	beforeState func(L *lua.State)
+	afterState  func(L *lua.State)
+	beforeFile  func(path string, L *lua.State)
+	afterFile   func(path string, L *lua.State, summary *RunSummary)
 }
 
 // New creates a test runner bound to a Go test.
@@ -48,71 +60,57 @@ func New(t testing.TB, opts ...Option) *Runner {
 	for _, opt := range opts {
 		opt(r)
 	}
-	// Auto-detect lib dir: look for lib/test.lua relative to module root
 	if r.libDir == "" {
 		r.libDir = findLibDir()
 	}
 	return r
 }
 
-// WithLibDir sets the directory containing Lua libraries (lib/test.lua etc).
-func WithLibDir(dir string) Option {
-	return func(r *Runner) {
-		r.libDir = dir
-	}
-}
-
-// WithSetup provides a function to customize the Lua state before tests run.
-// Use this to register application modules, mocks, etc.
-func WithSetup(fn func(L *lua.State)) Option {
-	return func(r *Runner) {
-		r.setup = fn
-	}
-}
-
-// WithVerbose enables verbose output.
-func WithVerbose() Option {
-	return func(r *Runner) {
-		r.verbose = true
-	}
-}
-
 // RunFile executes a single Lua test file.
 func (r *Runner) RunFile(path string) *RunSummary {
-	r.t.Helper()
+	return r.runLuaSource(path, nil, func(L *lua.State) error {
+		return L.DoFile(path)
+	})
+}
 
-	L := lua.NewState()
-	defer L.Close()
+// RunFileContext is like RunFile but respects ctx cancellation before work starts
+// and before loading the file. A running DoFile cannot be interrupted.
+func (r *Runner) RunFileContext(ctx context.Context, path string) *RunSummary {
+	return r.runLuaSource(path, ctx, func(L *lua.State) error {
+		return L.DoFile(path)
+	})
+}
 
-	// Set up package.path to find lib/test.lua
-	r.setupPackagePath(L)
+// RunString executes Lua test code from a string (useful for inline tests).
+func (r *Runner) RunString(code string) *RunSummary {
+	return r.runLuaSource("<string>", nil, func(L *lua.State) error {
+		return L.DoString(code)
+	})
+}
 
-	// Custom setup (register modules, mocks)
-	if r.setup != nil {
-		r.setup(L)
-	}
-
-	// Load and execute the test file (this collects tests via describe/it)
-	if err := L.DoFile(path); err != nil {
-		r.t.Fatalf("failed to load test file %s: %v", path, err)
-		return nil
-	}
-
-	// Call test.run() to execute collected tests
-	summary := r.executeTests(L)
-
-	// Report results to Go testing
-	r.reportToGoTest(summary, path)
-
-	return summary
+// RunStringContext is like RunString with the same cancellation semantics as RunFileContext.
+func (r *Runner) RunStringContext(ctx context.Context, code string) *RunSummary {
+	return r.runLuaSource("<string>", ctx, func(L *lua.State) error {
+		return L.DoString(code)
+	})
 }
 
 // RunDir discovers and runs all Lua test files in a directory.
 // Files matching test_*.lua or *_test.lua are considered test files.
+// Use WithRecursive(true) to include nested directories.
 func (r *Runner) RunDir(dir string) *RunSummary {
+	return r.runDir(dir, nil)
+}
+
+// RunDirContext runs each discovered file with RunFileContext.
+func (r *Runner) RunDirContext(ctx context.Context, dir string) *RunSummary {
+	return r.runDir(dir, ctx)
+}
+
+func (r *Runner) runDir(dir string, ctx context.Context) *RunSummary {
 	r.t.Helper()
 
-	files := discoverTestFiles(dir)
+	files := r.listTestFiles(dir)
 	if len(files) == 0 {
 		r.t.Logf("no test files found in %s", dir)
 		return &RunSummary{}
@@ -120,7 +118,16 @@ func (r *Runner) RunDir(dir string) *RunSummary {
 
 	combined := &RunSummary{}
 	for _, f := range files {
-		summary := r.RunFile(f)
+		if err := ctxErr(ctx); err != nil {
+			r.t.Fatalf("luatest: %v", err)
+			return combined
+		}
+		var summary *RunSummary
+		if ctx != nil {
+			summary = r.RunFileContext(ctx, f)
+		} else {
+			summary = r.RunFile(f)
+		}
 		if summary != nil {
 			combined.Results = append(combined.Results, summary.Results...)
 			combined.Passed += summary.Passed
@@ -132,37 +139,87 @@ func (r *Runner) RunDir(dir string) *RunSummary {
 	return combined
 }
 
-// RunString executes Lua test code from a string (useful for inline tests).
-func (r *Runner) RunString(code string) *RunSummary {
+func (r *Runner) runLuaSource(path string, ctx context.Context, load func(*lua.State) error) *RunSummary {
 	r.t.Helper()
 
+	if err := ctxErr(ctx); err != nil {
+		r.t.Fatalf("luatest: %v", err)
+		return nil
+	}
+
 	L := lua.NewState()
-	defer L.Close()
+	defer func() {
+		if r.afterState != nil {
+			r.afterState(L)
+		}
+		L.Close()
+	}()
+
+	if r.beforeState != nil {
+		r.beforeState(L)
+	}
 
 	r.setupPackagePath(L)
 	if r.setup != nil {
 		r.setup(L)
 	}
 
-	if err := L.DoString(code); err != nil {
-		r.t.Fatalf("failed to execute test code: %v", err)
+	if err := ctxErr(ctx); err != nil {
+		r.t.Fatalf("luatest: %v", err)
+		return nil
+	}
+
+	if r.beforeFile != nil {
+		r.beforeFile(path, L)
+	}
+
+	if err := load(L); err != nil {
+		if r.afterFile != nil {
+			r.afterFile(path, L, nil)
+		}
+		r.t.Fatalf("failed to load %s: %v", path, err)
 		return nil
 	}
 
 	summary := r.executeTests(L)
-	r.reportToGoTest(summary, "<string>")
+	if r.afterFile != nil {
+		r.afterFile(path, L, summary)
+	}
+
+	r.emitReport(path, summary)
 	return summary
+}
+
+func (r *Runner) emitReport(source string, summary *RunSummary) {
+	rep := r.reporter
+	if rep == nil {
+		rep = TBReporter{}
+	}
+	rep.Report(r.t, source, summary, ReportOptions{
+		Verbose:  r.verbose,
+		Subtests: r.subtests,
+	})
+}
+
+func ctxErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
 }
 
 func (r *Runner) setupPackagePath(L *lua.State) {
 	if r.libDir == "" {
 		return
 	}
-	// Add lib dir to package.path so require("lumi.test") works
 	code := fmt.Sprintf(`package.path = %q .. "/?.lua;" .. %q .. "/?/init.lua;" .. package.path`, r.libDir, r.libDir)
 	L.DoString(code)
 
-	// Register lib/test.lua as both "lumi.test" and "test" via package.preload
 	testLuaPath := filepath.Join(r.libDir, "test.lua")
 	if _, err := os.Stat(testLuaPath); err == nil {
 		preloadCode := fmt.Sprintf(`
@@ -177,19 +234,17 @@ func (r *Runner) setupPackagePath(L *lua.State) {
 }
 
 func (r *Runner) executeTests(L *lua.State) *RunSummary {
-	// Call: local result = require("lumi.test").run()
 	err := L.DoString(`return require("lumi.test").run()`)
 	if err != nil {
 		r.t.Fatalf("test.run() failed: %v", err)
 		return nil
 	}
-
-	// Parse the returned table
 	return r.parseResults(L)
 }
 
+// parseResults reads the table left on the stack by require("lumi.test").run().
+// Contract: see package doc (RunSummary / Lua keys).
 func (r *Runner) parseResults(L *lua.State) *RunSummary {
-	// The result table is at the top of the stack
 	if !L.IsTable(-1) {
 		r.t.Fatal("test.run() did not return a table")
 		return nil
@@ -201,7 +256,6 @@ func (r *Runner) parseResults(L *lua.State) *RunSummary {
 	summary.Errored = int(L.GetFieldInt(-1, "errored"))
 	summary.Total = int(L.GetFieldInt(-1, "total"))
 
-	// Parse results array
 	L.GetField(-1, "results")
 	if L.IsTable(-1) {
 		n := int(L.RawLen(-1))
@@ -214,7 +268,6 @@ func (r *Runner) parseResults(L *lua.State) *RunSummary {
 					Passed: L.GetFieldBool(-1, "passed"),
 					Error:  L.GetFieldString(-1, "error"),
 				}
-				// duration is in seconds (os.clock())
 				dur := L.GetFieldNumber(-1, "duration")
 				result.Duration = time.Duration(dur * float64(time.Second))
 				summary.Results = append(summary.Results, result)
@@ -222,60 +275,50 @@ func (r *Runner) parseResults(L *lua.State) *RunSummary {
 			L.Pop(1)
 		}
 	}
-	L.Pop(1) // pop results table
-	L.Pop(1) // pop main result table
+	L.Pop(1)
+	L.Pop(1)
 
 	return summary
 }
 
-func (r *Runner) reportToGoTest(summary *RunSummary, source string) {
-	if summary == nil {
-		return
+func (r *Runner) listTestFiles(dir string) []string {
+	matchName := func(name string) bool {
+		return (strings.HasPrefix(name, "test_") && strings.HasSuffix(name, ".lua")) ||
+			strings.HasSuffix(name, "_test.lua")
 	}
 
-	for _, result := range summary.Results {
-		testName := fmt.Sprintf("%s/%s", result.Suite, result.Name)
-		if result.Passed {
-			if r.verbose {
-				r.t.Logf("  ✓ %s (%.1fms)", testName, float64(result.Duration)/float64(time.Millisecond))
-			}
-		} else {
-			r.t.Errorf("  ✗ %s\n    %s", testName, result.Error)
+	var files []string
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
-	}
-
-	if summary.Failed > 0 || summary.Errored > 0 {
-		r.t.Errorf("%s: %d passed, %d failed, %d errors (total %d)",
-			source, summary.Passed, summary.Failed, summary.Errored, summary.Total)
-	} else if r.verbose {
-		r.t.Logf("%s: all %d tests passed", source, summary.Total)
-	}
-}
-
-// discoverTestFiles finds test files in a directory (non-recursive).
-func discoverTestFiles(dir string) []string {
-	entries, err := os.ReadDir(dir)
+		if d.IsDir() {
+			cleanPath := filepath.Clean(path)
+			cleanDir := filepath.Clean(dir)
+			if cleanPath == cleanDir {
+				return nil
+			}
+			if !r.recursive {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !matchName(d.Name()) {
+			return nil
+		}
+		if r.fileMatcher != nil && !r.fileMatcher(path) {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	})
 	if err != nil {
 		return nil
-	}
-	var files []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		name := e.Name()
-		if strings.HasPrefix(name, "test_") && strings.HasSuffix(name, ".lua") {
-			files = append(files, filepath.Join(dir, name))
-		} else if strings.HasSuffix(name, "_test.lua") {
-			files = append(files, filepath.Join(dir, name))
-		}
 	}
 	return files
 }
 
-// findLibDir tries to locate the lib/ directory relative to the working directory.
 func findLibDir() string {
-	// Walk up from cwd looking for lib/test.lua
 	dir, _ := os.Getwd()
 	for i := 0; i < 5; i++ {
 		candidate := filepath.Join(dir, "lib")
