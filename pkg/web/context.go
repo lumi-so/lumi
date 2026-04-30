@@ -9,6 +9,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// PushContextProxy pushes a Lua table representing the request context.
+// This is the table passed to Lua handlers with methods like c:json(), c:get(), etc.
+// Exported for use by applications that build custom handler dispatchers.
+func PushContextProxy(L *lua.State) {
+	pushContextProxy(L)
+}
+
 // pushContextProxy pushes a Lua table representing the request context.
 // The table has methods: get, param, query, postForm, header, body,
 // json, html, redirect, setHeader, setCookie, set, abort, next, status,
