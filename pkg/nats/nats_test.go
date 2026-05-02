@@ -1,6 +1,7 @@
 package nats
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -150,10 +151,58 @@ func TestPublishSubscribe(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestRequestReply
+// TestRequestReply — full round trip with Go-level async responder
 // ---------------------------------------------------------------------------
 
 func TestRequestReply(t *testing.T) {
+	_, url := startEmbeddedNATS(t)
+
+	// Set up an async responder in Go (goroutine-safe callback)
+	nc, err := natscli.Connect(url)
+	if err != nil {
+		t.Fatalf("responder connect: %v", err)
+	}
+	defer nc.Close()
+
+	nc.Subscribe("echo", func(msg *natscli.Msg) {
+		response := "reply:" + string(msg.Data)
+		msg.Respond([]byte(response))
+	})
+
+	// Requester in Lua
+	L := newLuaState(t)
+
+	code := `
+		local nats = require("nats")
+		local conn, err = nats.connect("` + url + `")
+		assert(err == nil, "connect failed: " .. tostring(err))
+
+		local reply, err = conn:request("echo", "hello", 2000)
+		assert(err == nil, "request failed: " .. tostring(err))
+		assert(reply ~= nil, "reply should not be nil")
+		-- Reply subject starts with "_INBOX." (inbox prefix)
+		assert(string.sub(reply:subject(), 1, 7) == "_INBOX.", "reply subject should start with _INBOX.")
+		assert(reply:data() == "reply:hello", "unexpected reply data: " .. reply:data())
+		assert(reply:reply() == nil, "reply.reply should be nil")
+
+		-- Second request to verify reusability
+		local reply2, err = conn:request("echo", "world", 2000)
+		assert(err == nil, "request2 failed: " .. tostring(err))
+		assert(reply2:data() == "reply:world", "unexpected reply2 data: " .. reply2:data())
+
+		conn:close()
+	`
+
+	if err := L.DoString(code); err != nil {
+		t.Fatalf("lua error: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestRequestReplyTimeout — verify timeout when no responder exists
+// ---------------------------------------------------------------------------
+
+func TestRequestReplyTimeout(t *testing.T) {
 	_, url := startEmbeddedNATS(t)
 	L := newLuaState(t)
 
@@ -162,30 +211,12 @@ func TestRequestReply(t *testing.T) {
 		local conn, err = nats.connect("` + url + `")
 		assert(err == nil, "connect failed: " .. tostring(err))
 
-		-- Set up a replier
-		local sub, err = conn:subscribe("test.request")
-		assert(err == nil, "subscribe failed: " .. tostring(err))
+		-- No one is subscribed to "nobody.home" — should time out
+		local reply, err = conn:request("nobody.home", "ping", 300)
+		assert(reply == nil, "reply should be nil on timeout")
+		assert(err ~= nil, "err should not be nil on timeout")
 
-		-- Second connection for making requests
-		local conn2, err = nats.connect("` + url + `")
-		assert(err == nil, "connect2 failed: " .. tostring(err))
-
-		-- Send request (times out since no responder yet, but msg is queued)
-		local reply, err = conn2:request("test.request", "ping", 500)
-		-- reply is nil on timeout, err is non-nil
-
-		-- Get the request from the sub
-		local req = sub:next_msg(2000)
-		assert(req ~= nil, "should receive request")
-		assert(req:data() == "ping", "request data mismatch")
-
-		-- Respond to it
-		local ok, err = req:respond("pong")
-		assert(ok == true, "respond failed: " .. tostring(err))
-
-		sub:unsubscribe()
 		conn:close()
-		conn2:close()
 	`
 
 	if err := L.DoString(code); err != nil {
@@ -344,52 +375,247 @@ func TestDrain(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestRespondWithoutRequest — Go-level test using NATS client directly
+// TestNextMsgAfterUnsubscribe — verify error after unsubscribe
 // ---------------------------------------------------------------------------
 
-func TestRespondWithoutRequest(t *testing.T) {
+func TestNextMsgAfterUnsubscribe(t *testing.T) {
+	_, url := startEmbeddedNATS(t)
+	L := newLuaState(t)
+
+	code := `
+		local nats = require("nats")
+		local conn, err = nats.connect("` + url + `")
+		assert(err == nil, "connect failed: " .. tostring(err))
+
+		local sub, err = conn:subscribe("test.unsub")
+		assert(err == nil, "subscribe failed: " .. tostring(err))
+
+		sub:unsubscribe()
+
+		-- next_msg after unsubscribe should return nil + error
+		local msg, err = sub:next_msg(500)
+		assert(msg == nil, "msg should be nil after unsubscribe")
+		assert(err ~= nil, "err should not be nil after unsubscribe")
+
+		conn:close()
+	`
+
+	if err := L.DoString(code); err != nil {
+		t.Fatalf("lua error: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPublishNoSubscribers — publishing without subscribers succeeds silently
+// ---------------------------------------------------------------------------
+
+func TestPublishNoSubscribers(t *testing.T) {
+	_, url := startEmbeddedNATS(t)
+	L := newLuaState(t)
+
+	code := `
+		local nats = require("nats")
+		local conn, err = nats.connect("` + url + `")
+		assert(err == nil, "connect failed: " .. tostring(err))
+
+		-- Publish to a subject with no subscribers — should succeed
+		local ok, err = conn:publish("no.one.listening", "hello")
+		assert(ok == true, "publish should succeed even without subscribers")
+		assert(err == nil, "err should be nil: " .. tostring(err))
+
+		conn:close()
+	`
+
+	if err := L.DoString(code); err != nil {
+		t.Fatalf("lua error: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestBinaryData — verify binary/non-UTF8 data round-trips correctly
+// ---------------------------------------------------------------------------
+
+func TestBinaryData(t *testing.T) {
+	_, url := startEmbeddedNATS(t)
+	L := newLuaState(t)
+
+	code := `
+		local nats = require("nats")
+		local conn, err = nats.connect("` + url + `")
+		assert(err == nil, "connect failed: " .. tostring(err))
+
+		local sub, err = conn:subscribe("test.binary")
+		assert(err == nil, "subscribe failed: " .. tostring(err))
+
+		-- Binary data with null bytes and high bytes
+		local binary = string.char(0, 1, 2, 255, 254, 253)
+		local ok, err = conn:publish("test.binary", binary)
+		assert(ok == true, "publish binary failed: " .. tostring(err))
+
+		local msg = sub:next_msg(2000)
+		assert(msg ~= nil, "msg should not be nil")
+		local data = msg:data()
+		assert(#data == 6, "expected 6 bytes, got " .. tostring(#data))
+		assert(string.byte(data, 1) == 0, "byte 1 mismatch")
+		assert(string.byte(data, 2) == 1, "byte 2 mismatch")
+		assert(string.byte(data, 3) == 2, "byte 3 mismatch")
+		assert(string.byte(data, 4) == 255, "byte 4 mismatch")
+		assert(string.byte(data, 5) == 254, "byte 5 mismatch")
+		assert(string.byte(data, 6) == 253, "byte 6 mismatch")
+
+		sub:unsubscribe()
+		conn:close()
+	`
+
+	if err := L.DoString(code); err != nil {
+		t.Fatalf("lua error: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestRequestReplyBinary — request-reply with binary payload via Go responder
+// ---------------------------------------------------------------------------
+
+func TestRequestReplyBinary(t *testing.T) {
 	_, url := startEmbeddedNATS(t)
 
-	// Connect via Go client
+	// Go-level responder that echoes binary data
+	nc, err := natscli.Connect(url)
+	if err != nil {
+		t.Fatalf("responder connect: %v", err)
+	}
+	defer nc.Close()
+
+	nc.Subscribe("bin.echo", func(msg *natscli.Msg) {
+		// Prefix and return
+		response := append([]byte("ok:"), msg.Data...)
+		msg.Respond(response)
+	})
+
+	// Requester in Lua
+	L := newLuaState(t)
+
+	code := `
+		local nats = require("nats")
+		local conn, err = nats.connect("` + url + `")
+		assert(err == nil, "connect failed: " .. tostring(err))
+
+		-- Send binary with null bytes
+		local payload = string.char(0, 255, 128, 0)
+		local reply, err = conn:request("bin.echo", payload, 2000)
+		assert(err == nil, "request failed: " .. tostring(err))
+		assert(reply ~= nil, "reply should not be nil")
+
+		local data = reply:data()
+		-- Expected: "ok:" prefix + original payload (7 bytes total)
+		assert(#data == 7, "expected 7 bytes, got " .. tostring(#data))
+		assert(string.sub(data, 1, 3) == "ok:", "prefix mismatch")
+		assert(string.byte(data, 4) == 0, "byte 4 mismatch")
+		assert(string.byte(data, 5) == 255, "byte 5 mismatch")
+		assert(string.byte(data, 6) == 128, "byte 6 mismatch")
+		assert(string.byte(data, 7) == 0, "byte 7 mismatch")
+
+		conn:close()
+	`
+
+	if err := L.DoString(code); err != nil {
+		t.Fatalf("lua error: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestConcurrentPublish — verify goroutine-safety with concurrent publishes
+// ---------------------------------------------------------------------------
+
+func TestConcurrentPublish(t *testing.T) {
+	_, url := startEmbeddedNATS(t)
+	L := newLuaState(t)
+
+	code := `
+		local nats = require("nats")
+		local conn, err = nats.connect("` + url + `")
+		assert(err == nil, "connect failed: " .. tostring(err))
+
+		local sub, err = conn:subscribe("test.concurrent")
+		assert(err == nil, "subscribe failed: " .. tostring(err))
+
+		-- Publish many messages sequentially
+		local received = {}
+		local count = 0
+		for i = 1, 20 do
+			local ok, err = conn:publish("test.concurrent", "msg-" .. tostring(i))
+			assert(ok == true, "publish " .. tostring(i) .. " failed")
+		end
+
+		for i = 1, 20 do
+			local msg = sub:next_msg(2000)
+			assert(msg ~= nil, "msg " .. tostring(i) .. " should not be nil")
+			received[msg:data()] = true
+			count = count + 1
+		end
+
+		-- Verify all 20 unique messages received
+		assert(count == 20, "expected 20 messages, got " .. tostring(count))
+		for i = 1, 20 do
+			assert(received["msg-" .. tostring(i)], "missing msg-" .. tostring(i))
+		end
+
+		sub:unsubscribe()
+		conn:close()
+	`
+
+	if err := L.DoString(code); err != nil {
+		t.Fatalf("lua error: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestGoLevelRequestReply — Go-level round trip using SubscribeSync + NextMsg
+// ---------------------------------------------------------------------------
+
+func TestGoLevelRequestReply(t *testing.T) {
+	_, url := startEmbeddedNATS(t)
+
 	nc, err := natscli.Connect(url)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	defer nc.Close()
 
-	// Subscribe and respond via Go
 	sub, err := nc.SubscribeSync("svc.echo")
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	defer sub.Unsubscribe()
 
-	// Make a request
+	// Responder goroutine
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req, err := sub.NextMsg(5 * time.Second)
+		if err != nil {
+			t.Errorf("nextMsg: %v", err)
+			return
+		}
+		if string(req.Data) != "hello" {
+			t.Errorf("got %q, want %q", req.Data, "hello")
+		}
+		if err := req.Respond([]byte("world")); err != nil {
+			t.Errorf("respond: %v", err)
+		}
+	}()
+
+	// Give goroutine time to start waiting
+	time.Sleep(100 * time.Millisecond)
+
 	reply, err := nc.Request("svc.echo", []byte("hello"), 2*time.Second)
 	if err != nil {
-		// The request might time out since we haven't set up responder yet
-		// But the message should be in the sub queue
+		t.Fatalf("request: %v", err)
+	}
+	if string(reply.Data) != "world" {
+		t.Fatalf("reply got %q, want %q", reply.Data, "world")
 	}
 
-	// Get the request from the sub
-	req, err := sub.NextMsg(2 * time.Second)
-	if err != nil {
-		t.Fatalf("nextMsg: %v", err)
-	}
-
-	if string(req.Data) != "hello" {
-		t.Fatalf("got %q, want %q", req.Data, "hello")
-	}
-
-	// Respond
-	if err := req.Respond([]byte("world")); err != nil {
-		t.Fatalf("respond: %v", err)
-	}
-
-	// If we had the reply from above, it would be "world"
-	if reply != nil {
-		if string(reply.Data) != "world" {
-			t.Fatalf("reply got %q, want %q", reply.Data, "world")
-		}
-	}
+	wg.Wait()
+	sub.Unsubscribe()
 }
