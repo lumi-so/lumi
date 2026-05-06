@@ -10,6 +10,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.44
 	github.com/nats-io/nats-server/v2 v2.14.0
 	github.com/nats-io/nats.go v1.51.0
+	go.etcd.io/bbolt v1.4.3
 )
 
 require (
